@@ -85,7 +85,7 @@
       "last_event_at": "2026-09-19T13:27:12.054Z",
       "event_count": 1944,
       "raw_event_count": 2960,
-      "file_path": "logs/Oliweitz/2026-09-19\\claude-code__13aa5cd9-7b61-44b9-b745-60080bec3601.jsonl",
+      "file_path": "logs/Oliweitz/2026-09-19/claude-code__13aa5cd9-7b61-44b9-b745-60080bec3601.jsonl",
       "collection_mode": "cli",
       "health": "ok",
       "model": "deepseek-flash"
