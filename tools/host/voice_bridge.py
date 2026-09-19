@@ -9,13 +9,22 @@ command, and hands that command back to the agent.
       -> AUDCODEC ADC capture (sf32lb_audcodec.c)
       -> binary WebSocket frames @16 kHz / 16-bit mono
       -> this script: energy VAD -> sherpa-onnx Paraformer (zh, offline)
-      -> transcript -> understanding step -> command
+      -> transcript -> wake phrase -> understanding step -> command
       -> {"type":"message","content":...} back to the device
       -> agent executes (cron tasks, telemetry, screen, ...)
+
+Two ways to address the device:
+
+  * the PTT button on the screen -- press to talk, the whole window is kept
+    and recognised in one piece;
+  * the wake phrase "你好openvela" -- say it, then the command. Both in one
+    breath works too. A command spoken without it is ignored, which is what
+    keeps room noise from firing commands at the agent.
 
 Usage:
     python3 voice_bridge.py [--host H] [--port P] [--seconds N]
                             [--thresh N] [--no-vad] [--save-wav DIR]
+                            [--no-wake]
 
 The device side must be running the agent with CONFIG_SF32LB52_AUDCODEC and
 the mic streaming support compiled in.
@@ -319,6 +328,67 @@ RULES: list[tuple[tuple[str, ...], str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Wake word
+# ---------------------------------------------------------------------------
+
+# The microphone already streams continuously, so the segmenter hears the
+# whole room; the wake phrase is what decides which part of it the agent
+# should act on. Exactly one phrase is accepted. Anything looser would let
+# room noise fire commands -- the recogniser always returns its best guess,
+# so an open microphone is a generator of plausible-looking nonsense.
+WAKE_PHRASE = "你好openvela"
+
+# Matching the whole phrase is not possible on this link. The microphone
+# samples at 5801 Hz, so everything above ~2.9 kHz is gone before the
+# recogniser sees it -- and the /v/ and /l/ that distinguish "vela" live up
+# there. Measured over four attempts the tail came back as "open renline",
+# "open rula", "ok v 乐" and "oppo via": never the brand, never twice the
+# same. "你好" came back correct every time.
+#
+# So the rule pins the half that survives and only asks for evidence of the
+# other: after the anchor, at least one ASCII letter. That is enough to keep
+# an ordinary "你好，介绍一下你自己" -- or a burst of room noise -- from
+# waking the device, while accepting every mangling seen in practice.
+WAKE_ANCHOR = "你好"
+
+# How long after the wake phrase a command is still accepted. Long enough to
+# say the two halves in separate breaths, short enough that walking away does
+# not leave the microphone live for whoever speaks next.
+WAKE_ARM_S = 8.0
+
+
+def normalize_speech(text: str) -> str:
+    """Fold a transcript down to letters, digits and CJK characters.
+
+    The recogniser will not spell a Latin brand the same way twice, and it
+    sprinkles punctuation through Chinese, so "你好，openvela" and
+    "你好 open vela" have to collapse to the same string before comparing.
+    """
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+WAKE_KEY = normalize_speech(WAKE_ANCHOR)
+
+
+def split_wake(text: str) -> tuple[bool, str]:
+    """Return (wake phrase heard, what was said after it).
+
+    The tail matters: "你好openvela，现在几点了" is a wake word and a command
+    in one breath, and the speaker should not have to say it twice.
+
+    See WAKE_ANCHOR above for why the tail is only checked for the presence
+    of a Latin letter rather than matched against the brand.
+    """
+    norm = normalize_speech(text)
+    if not norm.startswith(WAKE_KEY):
+        return False, ""
+    tail = norm[len(WAKE_KEY):]
+    if not any(ch.isascii() and ch.isalpha() for ch in tail):
+        return False, ""
+    return True, tail
+
+
 def understand(text: str, llm_url: str | None = None) -> str:
     """Turn a transcript into an instruction for the device agent.
 
@@ -394,6 +464,10 @@ class Bridge:
         self._ptt_on = False
         self._ptt_buf = bytearray()
         self._ptt_min_s = 0.3
+
+        # Set when the wake phrase is heard, and cleared when the command it
+        # armed arrives or the window expires.
+        self._wake_until = 0.0
 
         # Filled in by run(), so the control-frame handler can start a
         # recognition the same way the audio path does.
@@ -473,7 +547,48 @@ class Bridge:
         print("  [wav] wrote %s (%d Hz, %d samples)"
               % (path, rate, samples.size))
 
-    async def on_utterance(self, ws, pcm: bytes) -> None:
+    async def notify_wake(self, ws) -> None:
+        """Put something on the screen when the wake phrase lands.
+
+        Arming is invisible on its own: the device's recorder already streams,
+        so nothing changes until a command arrives several seconds later. That
+        leaves both the speaker and anyone watching unable to tell a successful
+        wake from a missed one.
+
+        The obvious cue -- lighting up the on-screen "录音中" indicator -- is
+        not available: it is driven by the same ptt frames the button sends,
+        and the device broadcasts those to every client, so the bridge would
+        receive its own frame and believe the physical button had been pressed.
+        A message is the only thing that reaches the UI queue.
+        """
+        try:
+            await ws.send(json.dumps({"type": "message",
+                                      "content": "（已唤醒，请说指令）"}))
+            print("  [wake] 已在屏幕上提示")
+        except Exception as exc:                     # noqa: BLE001
+            print("  [wake] could not notify the device: %s" % exc)
+
+    async def notify_dropped(self, ws) -> None:
+        """Tell the device that a PTT utterance produced no command.
+
+        Releasing the PTT button latches is_processing on the device, and the
+        only thing that clears it is a reply landing on the UI queue. The same
+        latch also blocks the button (ptt_btn_event_cb returns early while it
+        is set), so an utterance the recogniser could not turn into a command
+        used to leave the screen on "识别中..." with push-to-talk dead until
+        the board was reset.
+
+        Sending anything at all unlatches it, and saying so beats freezing
+        with no explanation.
+        """
+        try:
+            await ws.send(json.dumps({"type": "message",
+                                      "content": "（没听清，请再说一次）"}))
+            print("  [cmd] notified the device that nothing was understood")
+        except Exception as exc:                     # noqa: BLE001
+            print("  [cmd] could not notify the device: %s" % exc)
+
+    async def on_utterance(self, ws, pcm: bytes, via_ptt: bool = False) -> None:
         print("  [asr] start (%d bytes)" % len(pcm), flush=True)
         self.save_wav(pcm, "utt")
 
@@ -483,12 +598,58 @@ class Bridge:
 
         if not text:
             print("  [asr] (nothing recognised, %.2fs)" % dt)
+            if via_ptt:
+                await self.notify_dropped(ws)
             return
         print("  [asr] %.2fs  ->  %s" % (dt, text))
 
-        command = understand(text, self.args.llm_url)
+        # The wake check runs before understand(), because the rule table has
+        # a "你好" entry: without this ordering the wake phrase would match it
+        # and be dispatched as a command to introduce itself.
+        #
+        # The PTT button is already an explicit "this part was meant for you",
+        # so it bypasses the gate rather than demanding the phrase as well.
+        if not via_ptt:
+            heard, rest = split_wake(text)
+            if heard and rest:
+                # Usually the tail is the brand name as the link mangled it
+                # ("你好 oppo via" is the wake phrase on its own), not a
+                # command. Try it as one so a genuine same-breath command
+                # still works, but if it is not, arm and wait rather than
+                # dropping the turn -- the speaker has already said the wake
+                # word and should not have to say it again.
+                command = understand(rest, self.args.llm_url)
+                if command:
+                    print("  [wake] 唤醒词与指令同句 -> %s" % rest)
+                else:
+                    self._wake_until = time.time() + WAKE_ARM_S
+                    print("  [wake] 已唤醒 -- 请在 %.0f 秒内说出指令" % WAKE_ARM_S)
+                    await self.notify_wake(ws)
+                    return
+            elif heard:
+                self._wake_until = time.time() + WAKE_ARM_S
+                print("  [wake] 已唤醒 -- 请在 %.0f 秒内说出指令" % WAKE_ARM_S)
+                await self.notify_wake(ws)
+                return
+            elif self.args.no_wake:
+                command = understand(text, self.args.llm_url)
+            elif time.time() < self._wake_until:
+                self._wake_until = 0.0
+                print("  [wake] 已唤醒，接收指令")
+                command = understand(text, self.args.llm_url)
+            else:
+                # Printed rather than silently dropped: during tuning this is
+                # how you find out what the recogniser made of a phrase the
+                # matcher did not accept.
+                print("  [wake] 未唤醒，忽略：%s" % text)
+                return
+        else:
+            command = understand(text, self.args.llm_url)
+
         if not command:
             print("  [cmd] (not a known command, ignored)")
+            if via_ptt:
+                await self.notify_dropped(ws)
             return
         print("  [cmd] -> %s" % command)
 
@@ -534,6 +695,21 @@ class Bridge:
                                       ping_interval=None) as ws:
             print("[bridge] connected; starting device capture")
             await ws.send(json.dumps({"type": "mic_start"}))
+
+            # Clear any stale "识别中..." latch left on the device.
+            #
+            # Releasing the PTT button sets is_processing, and the only thing
+            # that clears it is a reply landing on the UI queue -- the same
+            # flag also blocks the button (lvgl_ui_channel.c ptt_btn_event_cb
+            # returns early while it is set). So a button press that happened
+            # while this bridge was down leaves push-to-talk dead until the
+            # board is reset, and nothing on this side can tell that it did.
+            #
+            # Any reply unlatches it, so ask for one on connect. That is what
+            # makes the chain recover on its own after a reconnect instead of
+            # needing someone to power-cycle the board.
+            await ws.send(json.dumps({"type": "message",
+                                      "content": "（语音链路已连接）"}))
 
             # Fresh segmenter state: half a sentence from the previous
             # session must not be glued onto the first one of this one.
@@ -676,11 +852,19 @@ class Bridge:
                 self._ptt_buf = bytearray()
                 secs = len(pcm) / 2.0 / float(self.rate or DEVICE_RATE)
                 if secs < self._ptt_min_s:
+                    # Dropping this silently is what wedged the button: the
+                    # device latched is_processing when it sent "stop", and
+                    # only a reply clears it. A double-tap (two clicks with
+                    # no speech between them) is the easiest mistake to make
+                    # with a toggle button, so it must answer too.
                     print("  [ptt] only %.2fs captured, ignored" % secs)
+                    self._pending.append(
+                        self._spawn(self.notify_dropped(self._ws)))
                 else:
                     print("  [ptt] captured %.2fs, recognising" % secs)
                     self._pending.append(
-                        self._spawn(self.on_utterance(self._ws, pcm)))
+                        self._spawn(self.on_utterance(self._ws, pcm,
+                                                      via_ptt=True)))
             return
 
         print("  [dev:%s] %s" % (kind, content))
@@ -702,6 +886,9 @@ def main() -> int:
                    help="use a fixed threshold instead of adapting to the room")
     p.add_argument("--save-wav", default=None,
                    help="directory to dump captured utterances into")
+    p.add_argument("--no-wake", action="store_true",
+                   help="accept any recognised command without requiring the "
+                        "wake phrase '%s' first" % WAKE_PHRASE)
     p.add_argument("--llm-url", default=os.environ.get("VOICE_LLM_URL"),
                    help="optional OpenAI-compatible endpoint for the "
                         "understanding step")

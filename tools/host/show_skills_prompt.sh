@@ -10,7 +10,8 @@
 RAW="$HOME/mock_raw.jsonl"
 
 if [ ! -r "$RAW" ]; then
-  echo "no raw dump; start the mock with ~/mock_restart_dbg.sh first"
+  echo "no raw dump; start the mock with ~/proxy_restart.sh --mock first"
+  echo "(that sets MOCK_DEBUG=1, which is what writes mock_raw.jsonl)"
   exit 1
 fi
 

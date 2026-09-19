@@ -6,15 +6,17 @@
 对着板子说话，设备本地理解、云端推理、屏幕用中文回你；同时它还会**按计划主动巡检设备状态**，
 不需要任何人开口。
 
-- **说一句话就能下命令**：设备麦克风采集 → PC 端离线 ASR（sherpa-onnx Paraformer）→
-  命令路由 → LLM 理解 → 设备执行（查时间 / 设定时任务 / 读内存 / 上屏）
+- **喊一声就能下命令**：说「你好openvela」唤醒（也可以点屏幕上的 PTT 按钮）→
+  设备麦克风采集 → PC 端离线 ASR（sherpa-onnx Paraformer）→ 命令路由 → LLM 理解 →
+  设备执行（查时间 / 设定时任务 / 读内存 / 上屏）
 - **主动巡检**：定时唤醒 agent，自动执行巡检并把结果推上屏幕与 PC 端，无需唤醒词
 - **屏上有中文**：自研 LVGL 聊天 UI + 内置 GB2312 中文字体（openvela 自带字体无 CJK 字形）
 - **零 WiFi 依赖**：板载无 WiFi，网络走 PPP over 串口；PC 端做 NAT 网关与 LLM 代理
 
 亮点在于**把一条不可能的组合跑通了**：无网卡设备 + 串口 12.7 KB/s 的实际带宽预算下，
-用 G.711 μ-law 把 16 kHz 音频压到 8 KB/s 无损上行，配合 PC 端零拷贝解码与离线识别，
-实现了「按住说话 → 秒级上屏 → 设备执行」的完整闭环，并连续运行 6 分钟零掉线。
+用 G.711 μ-law 把音频压到 5.8 KB/s 上行（单字节/样本 @5801 Hz，不丢样本），
+配合 PC 端离线识别，实现了「喊一声 → 设备执行 → 结果上屏」的完整闭环，
+并连续运行 6 分钟零掉线。
 
 ## 二、选题方向
 
@@ -36,13 +38,21 @@ src/vendor_sifli/       AUDCODEC ADC 录音驱动（openvela 全树首个可用�
 src/apps_pppd/          pppd 直连（空 modem）改动后的源文件
 docs/upstream/          ★ 部署说明 + 三个补丁（复现本作品从这里开始）
 docs/*.md|txt           设计与开发计划文档
+deliverable/            《作品介绍文档》（.md / .docx）与《演示视频脚本》
 tools/host/             PC 端完整工具链：串口桥、PPP 服务端、LLM 代理、
-                        语音桥、看门狗、诊断脚本（共 37 个）
+                        语音桥、看门狗、诊断脚本（共 36 个）
 logs/Oliweitz/          AI Coding 全量对话日志
 ```
 
 上游公共仓（packages/ai_agent、vendor/sifli、apps）的改动**不在本仓直接修改**，
-以 `docs/upstream/patches/` 下的三个补丁提交，同时按赛事要求另为各公共仓准备 PR。
+以 `docs/upstream/patches/` 下的三个补丁提交，并已按赛事要求向各公共仓的
+`dev-ai-contest-2026` 分支提交 PR：
+
+| 公共仓 | PR | 内容 |
+|---|---|---|
+| `packages_ai_agent` | [#43](https://github.com/open-vela/packages_ai_agent/pull/43) | 缺陷修复 + 语音/LVGL 通道 |
+| `vendor_sifli` | [#37](https://github.com/open-vela/vendor_sifli/pull/37) | AUDCODEC ADC 录音驱动 |
+| `nuttx-apps` | [#129](https://github.com/open-vela/nuttx-apps/pull/129) | pppd 直连链路 |
 
 ## 四、运行方式
 
@@ -102,7 +112,19 @@ bash ~/proxy_restart.sh    # 设备走明文 HTTP 到 PC，PC 转 HTTPS 出网
 
 ### 4.4 使用
 
-**a) 语音（主打）**——按住手表上的 PTT 按键说话，松开即识别。示例：
+**a) 语音（主打）**——两种方式，屏幕先出「稍等，处理中…」，随后给出结果
+（接真实 API 时约 10~30 秒，本地 mock 约 1 秒）：
+
+| 方式 | 操作 |
+|---|---|
+| **唤醒词** | 说「**你好openvela**」，再说指令；也可以一口气说完「你好openvela，现在几点了」。<br>只喊唤醒词时屏幕会提示「（已唤醒，请说指令）」，8 秒内说出指令即可 |
+| **PTT 按钮** | **点一下**蓝色按钮开始录音 → **说话** → **再点一下**结束<br>（点按切换；**两次点击之间**才是录音时间）PTT 不需要唤醒词 |
+
+> ⚠️ 说唤醒词时**中间不要停顿**——停顿会被切句器分成两段。
+> 识别器对 `openvela` 的转写不稳定（实测有 `open renline` / `ok v 乐` / `oppo via` 等），
+> 匹配规则认的是「你好 + 后面跟一段拉丁字母」，所以照常说即可，不用刻意念准。
+
+示例：
 
 | 说什么 | 发生什么 |
 |---|---|
@@ -135,7 +157,7 @@ curl http://192.168.223.2:28789/api/config   # 查看/下发 LLM 配置
 
 ## 五、AI Coding 使用说明
 
-本作品全程用 Claude Code 开发（赛事规定时间内完成于 2026-09-12 ~ 09-16 共 5 天）：
+本作品全程用 Claude Code 开发（赛事规定时间内完成于 2026-09-12 ~ 09-17 共 5 天）：
 
 - **需求拆解 / 方案设计**：用 AI 对比「设备直连 LLM vs PC 代理」「有无 WiFi 的可行路径」，
   最终定下 PPP-over-串口 + PC 代理的架构
