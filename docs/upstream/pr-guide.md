@@ -15,7 +15,9 @@
 # ① 网页 fork（已登录 Oliweitz 账号）
 #    https://github.com/open-vela/packages_ai_agent  -> Fork
 #    https://github.com/open-vela/vendor_sifli        -> Fork
-#    https://github.com/open-vela/apps                -> Fork
+#    https://github.com/open-vela/nuttx-apps          -> Fork
+#      （裸仓名以本仓 openvela.xml 的 name= 为准；open-vela/apps 是它的
+#        重定向别名，fork 出来同样叫 Oliweitz/nuttx-apps）
 
 # ② WSL 里加远端并拉取
 cd ~/openvela/packages/ai_agent
@@ -23,8 +25,11 @@ git remote add myfork https://github.com/Oliweitz/packages_ai_agent.git
 git fetch myfork dev-ai-contest-2026
 
 # ③ 确认身份（提交会带上你的名字）
+#    ⚠️ 必须用 CLA 里签的那个邮箱，不能用 GitHub 隐私邮箱！
+#    用 noreply 邮箱时 cla/signature 无法把 commit 归属到已签署的人，
+#    PR 会被直接拦掉（2026-09-17 在主仓 PR 上实际踩过）。
 git config user.name  Oliweitz
-git config user.email Oliweitz@users.noreply.github.com
+git config user.email 1497689711@qq.com
 
 # ④ 建分支（基于本地当前分支 HEAD，即干净的上游提交）
 git stash -u                                   # 暂存我们的工作树改动

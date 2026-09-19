@@ -301,7 +301,12 @@ def build_reply(req):
                 return tool_call("run_shell", {"command": cmds[done]})
             return text_reply(composer(tool_msgs))
 
-    return text_reply("[mock-llm] 收到: " + user[:120])
+    # Nothing matched. This is the offline fallback, so the device is talking
+    # to a script rather than a model -- but this text lands straight on the
+    # screen, and a debug echo there reads as a broken build. Say what is
+    # actually going on and point at what does work.
+    return text_reply("我现在离线运行，只应答预设指令。可以试试"
+                      "「现在几点了」「看一下设备的内存」或「每两分钟查一次」。")
 
 
 class Handler(BaseHTTPRequestHandler):
